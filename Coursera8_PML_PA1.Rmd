@@ -1,0 +1,213 @@
+---
+title: "Coursera - Machine Learning - Course Project"
+author: "peterkaj"
+date: "27 01 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE, fig.width=10, fig.height=8, fig.align = "center")
+```
+
+# Executive Summary
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. The goal in this project is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants and predict the manner in which they did the exercise ("classe" variable in the training set).
+
+After i have prepared the data and reduced unrelated features, i have trained/fitted several models and picked the best for predicting the "classe". Then i have used this model for predicting the "classe" on the 20 samples of the test data set.
+
+* Trained Models: Tree, LDA, RF (RandomForest), GBM (Generalized Boosted Model)
+
+* Best Model: GBM with an expected out-of-sample-error of 0.34%
+ 
+* 20 samples classification outcome: "B A B A A E D B A A B C B A E E A B B B" with a prediction accuracy of 100%
+
+# Overview
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project i will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+# Data
+
+### Loading the data
+
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data (means the new data, which has to be classified) are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+If the data sets are actually not available in the local directory "./data", a download puts these two files into this directory (which is created, if it is not present).
+```{r loading_data, message=FALSE}
+library(caret); library(randomForest); library(rpart); library(rattle); library(MASS); library(gbm)
+
+if (!file.exists("./data/pml-training.csv")){
+        if (!dir.exists("./data")) {dir.create("./data")}
+        fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+        download.file(fileUrl, destfile="./data/pml-training.csv", method = "curl")
+}
+traindata <- read.csv("./data/pml-training.csv")
+# Test data set (20 samples of new data)
+if (!file.exists("./data/pml-testing.csv")){
+        if (!dir.exists("./data")) {dir.create("./data")}
+        fileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+        download.file(fileUrl, destfile="./data/pml-testing.csv", method = "curl")
+}
+newdata_full <- read.csv("./data/pml-testing.csv")
+dim(traindata); dim(newdata_full)
+```
+
+### Feature Selection
+Goal of this part is the selection of features which have a relation to activity and removing the others from the data sets.
+Many of the features in the test data set contains only NA and are worthless for prediction. I will truncate this features without any loss of information in both of the datasets.
+```{r reduce_features_NA, message=FALSE}
+# Select only Testdata variables(columns) without NA
+nonaNew <- subset(newdata_full, select = !is.na(newdata_full[1,]))
+# Select only Traindata variables(columns) where Testdata is available -> Traindata set without NA
+nonaTrain <- subset(traindata, select = names(nonaNew[1:dim(nonaNew)[2]-1])) 
+nonaTrain$classe <- traindata$classe
+dim(nonaTrain); dim(nonaNew)
+```
+With this procedure i am able to reduce the number of variables/features from `r dim(traindata)[2]-1` to **`r dim(nonaTrain)[2]-1`**.
+
+Some of the remaining features doesn´t look like having a relation to activity and will also be truncated from data sets:
+
+* X ... only an index and contains no information about activity
+
+* cvtd_timestamp, raw_timestamp_part_1, raw_timestamp_part_2 ... timestamps with no relation to activity
+
+* num_window, new_window ... relation to timing, but none with activity
+
+```{r reduce_features_unrelated, message=FALSE}
+redTrain <- subset(nonaTrain, select = -c(X, cvtd_timestamp, raw_timestamp_part_1, raw_timestamp_part_2, num_window, new_window))
+newdata <- subset(nonaNew, select = -c(X, cvtd_timestamp, raw_timestamp_part_1, raw_timestamp_part_2, num_window, new_window))
+```
+This procedure leads to a further reduction from `r dim(nonaTrain)[2]-1` to **`r dim(redTrain)[2]-1`** variables/features.
+
+
+```{r reduce_features_nearZero, message=FALSE}
+nzVar <- nearZeroVar(redTrain, saveMetrics = TRUE)
+```
+A check for Near Zero Variables/Features results in **`r sum(nzVar$nzv==TRUE)`** Variables, which leads to no further reduction of features.
+
+For a possible other reduction of features i will perform a PCA (Principial Component Analysis) on the centered and scaled training set.
+```{r PCA_analysis, fig.width=8, fig.height=6,}
+prComp <- prcomp(redTrain[-c(1,54)], center=TRUE, scale. = TRUE)
+prComp_var <- cumsum(prComp$sdev^2) / sum(prComp$sdev^2)
+plot(prComp_var, main = "Explained Variance of PCA (scaled & centered)", ylab = "% variance", xlab = "Principal Component Index")
+```
+
+The cumulative sum of the variance explained through the several components of the PCA shows a monontone rising curve, where some of the variables could be reduced without significant loss in explaining the variance. But if i would proceed with PCA variables, i will loose the interpretation of features. So i decide in a first approach to proceed **without** PCA.
+
+### Creation of Training and Test data for model fitting and cross validation
+For cross validation and model testing some test data is necessary. This is done via a split of the training data into 2 data sets - traininig and testing - in a relation of 70% to 30%. The split is done via random subsampling.
+```{r create_datasets}
+# Create a training and testing data set
+set.seed(36826)
+inTrain <- createDataPartition(y=redTrain$classe, p=0.7, list=FALSE)
+training <- redTrain[inTrain,]
+testing <- redTrain[-inTrain,]
+dim(training); dim(testing); dim(newdata)
+```
+
+# Model
+I will train (based on the training data set) several models to predict the manner in which the people did the exercise (classification into 5 different classes within the variable "classe"). Afterwards i will perform predictions on the test data set (cross validation) with every model and pick the model with the best results to perform a prediction based on the new data set.
+
+### Trees
+```{r Model_rpart, fig.width=10, fig.height=6,}
+# Tree Model
+mod_tree <- train(classe ~ ., data=training, method = "rpart", preProcess=c("center", "scale"))
+pred_tree <- predict(mod_tree, testing)
+acc_tree <- prettyNum(confusionMatrix(pred_tree, testing$classe)$overall)
+confusionMatrix(pred_tree, testing$classe)
+fancyRpartPlot(mod_tree$finalModel)
+```
+
+### LDA (Linear Discriminant Analysis)
+```{r Model_lda}
+# LDA Model
+mod_lda <- train(classe ~ ., data=training, method = "lda", preProcess=c("center", "scale"))
+pred_lda <- predict(mod_lda, testing)
+acc_lda <- prettyNum(confusionMatrix(pred_lda, testing$classe)$overall)
+confusionMatrix(pred_lda, testing$classe)
+```
+
+### Random Forests
+```{r Model_rf, fig.height=4, fig.width=9}
+# Random Forest Model
+mod_rf <- randomForest(classe ~ ., data=training, prox=TRUE, preProcess=c("center", "scale"))
+result <- rfcv(training[,-54], training$classe)
+pred_rf <- predict(mod_rf, testing)
+acc_rf <- prettyNum(confusionMatrix(pred_rf, testing$classe)$overall)
+confusionMatrix(predict(mod_rf, testing), testing$classe)
+par(mfrow=c(1,2))
+with(result, plot(n.var, error.cv, type="o", lwd=2, main="Cross Validation Error vs #variables"))
+plot(mod_rf, main="Classification error rate vs #trees")
+par(mfrow=c(1,1))
+```
+
+The cross validation error in relation to the number of variables/features is a monotone decreasing curve, which means there is no overfitting with too many variables. For decreasing the cv error significantly only a few variables are nessessary. This outcome could be expected from the Principial Component Analyses above. So model tuning could be done with a tradeoff between number of variables and accuracy with respect to calculation time. I decide to proceed with all variables and the highest accuracy, spending some more calculation time. The classification error rate doesn´t decrease significantly above ~150 trees, thats why the tuning parameter "ntree" could be reduced, which decreases calculation time.
+
+```{r Model_rf_imp}
+imp <- as.data.frame(mod_rf$importance)
+imp$variable <- rownames(imp)
+imp <- imp[order(imp[1], decreasing=TRUE),]
+head(imp,10); tail(imp,10)
+```
+The importance of the variables is listed above (Top10, Last10). It is a measure for the total decrease in node impuriies from splitting on the variable, averaged over all trees and measured by the Gini Index.
+
+### GBM Generalized Boosted Model
+Beyond this report i have done some model performance tuning (different model parameter settings) to find a suitable tradeoff between accuracy and calculation time. Afterwards i selected the best parameter set and fitted the model. I have attached the tuning parameters without guarantee of reproducibility.
+```{r Model_glm, message=FALSE, warning=FALSE}
+# GBM Generalized Boosted Model
+mod_gbm <- gbm(classe ~ ., data = training, distribution = "multinomial", n.trees=1000, shrinkage = 0.2,
+                    interaction.depth = 10, cv.folds=0, verbose=FALSE, n.cores=4)
+pred_gbm <- predict(object=mod_gbm, newdata = testing[,-54], n.trees = gbm.perf(mod_gbm, plot.it = FALSE), type = "response")
+pred_gbm_cat <- as.factor(apply(pred_gbm, 1, which.max)) # Classification = Class with highest probability
+levels(pred_gbm_cat) <- c("A","B","C","D","E") #Prediction output as Factor variable
+acc_gbm <- prettyNum(confusionMatrix(pred_gbm_cat, testing$classe)$overall)
+confusionMatrix(pred_gbm_cat, testing$classe)
+# gbm() Performance tuning
+# Accuracy n.trees shrinkage interaction.depth cv.folds calc_time[sec]
+#   0.7293    250    0.001          5              3     1.51769 min
+#   0.8226   1000    0.001          5              3     5.83640 min
+#   0.9730   1000    0.01           5              3     5.58111 min
+#   0.9096   3000    0.001          5              3    17.28626 min
+#   0.7325    250    0.001          5              0    47.4728 sec
+#   0.5412    250    0.001          1              0    12.2535 sec
+#   0.6386    250    0.001          2              0    21.5739 sec
+#   0.6780    250    0.001          3              0    31.9862 sec
+#   0.6783    250    0.001          3              3     1.00142 min
+#   0.8425    250    0.01           3              0    31.7111 sec
+#   0.9592    250    0.05           3              0    30.5457 sec
+#   0.9806    250    0.1            3              0    31.8826 sec
+#   0.9895    250    0.2            3              0    30.4324 sec
+#   0.9567    250    0.5            3              0    31.8826 sec
+#   0.9934    250    0.2            7              0     1.03756 min
+#   0.9951    250    0.2           10              0     1.45154 min
+#   0.9952    250    0.2           15              0     2.00576 min
+#   0.9922   1000    0.2            3              0     1.99028 min
+#   0.9951   1000    0.2            5              0     3.04000 min
+#   0.9964   1000    0.2            7              0     3.97441 min
+#   0.9975   1000    0.2           10              0     5.67936 min  #Selected Parameterset
+```
+
+
+### Model Selection
+```{r Model Selection}
+test_sum <- rbind(tree=acc_tree, LDA=acc_lda, RandomForest=acc_rf, GBM=acc_gbm)
+as.data.frame(test_sum)[1:4]
+```
+For predicting the 20 samples in the test data i will choose the best fitted model with the highest accuracy and the lowest out-of-sample-error, which leads to the GBM (Generalized Boosted Model) with an estimated out-of-sample-error of `r prettyNum((1-as.numeric(acc_gbm[1]))*100)`%.
+
+# Prediction and Submission of test data
+Now i am using the GBM Model to predict the 20 test samples.
+```{r testdata, message=FALSE, warning=FALSE}
+pred20 <- predict(object=mod_gbm, newdata = newdata[,-54], n.trees = gbm.perf(mod_gbm, plot.it = FALSE), type = "response")
+pred20_cat <- as.factor(apply(pred20, 1, which.max)) # Classification = Class with highest probability
+levels(pred20_cat) <- c("A","B","C","D","E") #Prediction output as Factor variable
+pred20_cat
+```
+The predicted outcome is "`r pred20_cat`", which was also my submission to the "Course Project Prediction Quiz" with the outcome of 100% success, which means an prediction accuracy of 100% :-)
+
+
+End of Report
